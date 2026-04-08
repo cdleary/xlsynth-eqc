@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "xlsynth-eqc"
+version = "0.1.0"
+edition = "2024"
+authors = ["Christopher D. Leary <cdleary@gmail.com>"]
+description = "Sled-backed equivalence-class corpus management for XLS IR"
+license = "Apache-2.0"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5.21", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sled = "0.34"
+zstd = "0.13"
+xlsynth-pir = { path = "../xlsynth-crate/xlsynth-pir", version = "0.40.0" }
+xlsynth-prover = { path = "../xlsynth-crate/xlsynth-prover", version = "0.40.0" }
+
+[dev-dependencies]
+tempfile = "3.20"
