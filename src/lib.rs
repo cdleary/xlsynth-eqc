@@ -10,18 +10,21 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use xlsynth_pir::ir;
 use xlsynth_pir::ir_parser;
+use xlsynth_pir::ir_utils::fn_node_count;
 use xlsynth_pir::node_hashing::compute_function_structural_hash;
 use xlsynth_prover::prover;
 use xlsynth_prover::prover::Prover;
 use xlsynth_prover::prover::SolverChoice;
 use xlsynth_prover::prover::types::{AssertionSemantics, EquivParallelism, EquivResult, ProverFn};
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const TREE_METADATA: &str = "metadata";
 const TREE_MEMBERS: &str = "members";
+const TREE_IR_TEXT: &str = "ir_text";
 const TREE_TAG_INDEX: &str = "tag_index";
 const KEY_SCHEMA_VERSION: &[u8] = b"schema_version";
-const MEMBER_ROW_ZSTD_MAGIC: &[u8] = b"EQCZSTD1";
+const IR_TEXT_ZSTD_MAGIC: &[u8] = b"EQCIRTXT1";
+const IR_NODE_COUNT_TAG_PREFIX: &str = "ir-nodes:";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProofOptions {
@@ -122,7 +125,6 @@ pub struct InvariantReport {
 struct StoredMemberValue {
     package_name: String,
     top_name: String,
-    ir_text: String,
     #[serde(default)]
     metadata: StoredMemberMetadataValue,
 }
@@ -206,7 +208,6 @@ impl LoadedIr {
         StoredMemberValue {
             package_name: self.package_name.clone(),
             top_name: self.top_name.clone(),
-            ir_text: self.canonical_ir_text.clone(),
             metadata,
         }
     }
@@ -243,10 +244,11 @@ impl EquivalenceClassDb {
 
     pub fn list_members(&self) -> Result<Vec<StoredMember>> {
         let tree = self.members_tree()?;
+        let ir_text_tree = self.ir_text_tree()?;
         let mut members = Vec::with_capacity(tree.len());
         for row in &tree {
             let (key, value) = row.context("reading member row from sled")?;
-            members.push(decode_member_row(&key, &value)?);
+            members.push(decode_member_row(&key, &value, &ir_text_tree)?);
         }
         Ok(members)
     }
@@ -279,13 +281,18 @@ impl EquivalenceClassDb {
         }
 
         let members_tree = self.members_tree()?;
+        let ir_text_tree = self.ir_text_tree()?;
         let mut members = Vec::new();
         for structural_hash in matching_hashes.unwrap_or_default() {
             let value = members_tree
                 .get(structural_hash.as_bytes())
                 .with_context(|| format!("loading member {structural_hash} from sled"))?
                 .ok_or_else(|| anyhow!("tag index referenced missing member {structural_hash}"))?;
-            members.push(decode_member_row(structural_hash.as_bytes(), &value)?);
+            members.push(decode_member_row(
+                structural_hash.as_bytes(),
+                &value,
+                &ir_text_tree,
+            )?);
         }
         Ok(members)
     }
@@ -528,13 +535,20 @@ impl EquivalenceClassDb {
         candidate: &LoadedIr,
         metadata: StoredMemberMetadataValue,
     ) -> Result<()> {
+        let metadata = with_derived_member_tags(candidate, metadata);
         let tree = self.members_tree()?;
+        let ir_text_tree = self.ir_text_tree()?;
         let tag_index = self.tag_index_tree()?;
-        let raw_value = serde_json::to_vec(&candidate.stored_value(metadata.clone()))
-            .context("serializing member for sled storage")?;
-        let value = encode_member_row_value(&raw_value)?;
+        let value = serde_json::to_vec(&candidate.stored_value(metadata.clone()))
+            .context("serializing member metadata for sled storage")?;
         tree.insert(candidate.structural_hash.as_bytes(), value)
             .with_context(|| format!("inserting member {}", candidate.structural_hash))?;
+        ir_text_tree
+            .insert(
+                candidate.structural_hash.as_bytes(),
+                encode_ir_text_value(candidate.canonical_ir_text.as_bytes())?,
+            )
+            .with_context(|| format!("inserting IR text {}", candidate.structural_hash))?;
         for tag in &metadata.tags {
             tag_index
                 .insert(tag_index_key(tag, &candidate.structural_hash), &[][..])
@@ -561,6 +575,12 @@ impl EquivalenceClassDb {
             .context("opening members tree")
     }
 
+    fn ir_text_tree(&self) -> Result<sled::Tree> {
+        self.db
+            .open_tree(TREE_IR_TEXT)
+            .context("opening IR text tree")
+    }
+
     fn tag_index_tree(&self) -> Result<sled::Tree> {
         self.db
             .open_tree(TREE_TAG_INDEX)
@@ -582,18 +602,17 @@ fn decode_schema_version(bytes: &[u8]) -> Result<u32> {
     Ok(u32::from_be_bytes(version_bytes))
 }
 
-fn decode_member_row(key: &[u8], value: &[u8]) -> Result<StoredMember> {
+fn decode_member_row(key: &[u8], value: &[u8], ir_text_tree: &sled::Tree) -> Result<StoredMember> {
     let structural_hash = std::str::from_utf8(key)
         .context("member key was not valid UTF-8")?
         .to_string();
-    let decoded_value = decode_member_row_value(value)?;
     let value: StoredMemberValue =
-        serde_json::from_slice(&decoded_value).context("deserializing stored member value")?;
+        serde_json::from_slice(value).context("deserializing stored member metadata value")?;
     Ok(StoredMember {
         structural_hash,
         package_name: value.package_name,
         top_name: value.top_name,
-        ir_text: value.ir_text,
+        ir_text: load_ir_text(ir_text_tree, key)?,
         metadata: decode_member_metadata(value.metadata),
     })
 }
@@ -623,23 +642,49 @@ fn normalize_new_member_metadata(
     })
 }
 
-fn encode_member_row_value(raw_bytes: &[u8]) -> Result<Vec<u8>> {
-    let compressed = zstd::bulk::compress(raw_bytes, 3).context("zstd compressing member row")?;
-    let framed_len = MEMBER_ROW_ZSTD_MAGIC.len() + compressed.len();
+fn with_derived_member_tags(
+    candidate: &LoadedIr,
+    mut metadata: StoredMemberMetadataValue,
+) -> StoredMemberMetadataValue {
+    metadata.tags.insert(ir_node_count_tag(candidate.top_fn()));
+    metadata
+}
+
+fn ir_node_count_tag(ir_fn: &ir::Fn) -> String {
+    format!("{IR_NODE_COUNT_TAG_PREFIX}{}", fn_node_count(ir_fn))
+}
+
+fn encode_ir_text_value(raw_bytes: &[u8]) -> Result<Vec<u8>> {
+    let compressed = zstd::bulk::compress(raw_bytes, 3).context("zstd compressing IR text")?;
+    let framed_len = IR_TEXT_ZSTD_MAGIC.len() + compressed.len();
     if framed_len >= raw_bytes.len() {
         return Ok(raw_bytes.to_vec());
     }
     let mut encoded = Vec::with_capacity(framed_len);
-    encoded.extend_from_slice(MEMBER_ROW_ZSTD_MAGIC);
+    encoded.extend_from_slice(IR_TEXT_ZSTD_MAGIC);
     encoded.extend_from_slice(&compressed);
     Ok(encoded)
 }
 
-fn decode_member_row_value(stored_bytes: &[u8]) -> Result<Vec<u8>> {
-    let Some(payload) = stored_bytes.strip_prefix(MEMBER_ROW_ZSTD_MAGIC) else {
-        return Ok(stored_bytes.to_vec());
+fn decode_ir_text_value(stored_bytes: &[u8]) -> Result<String> {
+    let decoded = match stored_bytes.strip_prefix(IR_TEXT_ZSTD_MAGIC) {
+        Some(payload) => {
+            zstd::stream::decode_all(Cursor::new(payload)).context("zstd decoding IR text")?
+        }
+        None => stored_bytes.to_vec(),
     };
-    zstd::stream::decode_all(Cursor::new(payload)).context("zstd decoding member row")
+    String::from_utf8(decoded).context("stored IR text was not valid UTF-8")
+}
+
+fn load_ir_text(ir_text_tree: &sled::Tree, key: &[u8]) -> Result<String> {
+    let structural_hash = std::str::from_utf8(key)
+        .context("member key was not valid UTF-8")?
+        .to_string();
+    let stored_bytes = ir_text_tree
+        .get(key)
+        .with_context(|| format!("loading IR text {structural_hash} from sled"))?
+        .ok_or_else(|| anyhow!("missing IR text row for member {structural_hash}"))?;
+    decode_ir_text_value(stored_bytes.as_ref())
 }
 
 fn normalize_tags(tags: &[String]) -> Result<Vec<String>> {
@@ -820,13 +865,77 @@ top fn renamed_fn(arg: bits[8]) -> bits[8] {
         }
     }
 
+    fn ir_node_count_tag_for_path(path: &Path) -> String {
+        let loaded = LoadedIr::from_path(path, None).expect("load IR for node count tag");
+        ir_node_count_tag(loaded.top_fn())
+    }
+
     #[test]
-    fn member_row_compression_roundtrips() {
+    fn ir_text_compression_roundtrips() {
         let raw = vec![b'a'; 4096];
-        let encoded = encode_member_row_value(&raw).expect("encode row");
-        assert!(encoded.starts_with(MEMBER_ROW_ZSTD_MAGIC));
-        let decoded = decode_member_row_value(&encoded).expect("decode row");
-        assert_eq!(decoded, raw);
+        let encoded = encode_ir_text_value(&raw).expect("encode IR text");
+        assert!(encoded.starts_with(IR_TEXT_ZSTD_MAGIC));
+        let decoded = decode_ir_text_value(&encoded).expect("decode IR text");
+        assert_eq!(decoded.as_bytes(), raw.as_slice());
+    }
+
+    #[test]
+    fn member_metadata_and_ir_text_are_stored_in_separate_trees() {
+        let (tempdir, db_path) = make_temp_db();
+        let ir_path = write_ir(&tempdir, "seed.ir", IDENTITY_IR);
+
+        let db = EquivalenceClassDb::init(&db_path).expect("init db");
+        db.add_ir_path_with_metadata(
+            &ir_path,
+            None,
+            &metadata_with(&["bf16", "seed"], Some("generator"), 1_700_000_000),
+            &ProofOptions::default(),
+        )
+        .expect("add with metadata");
+
+        let member = db
+            .list_members()
+            .expect("list members")
+            .into_iter()
+            .next()
+            .expect("seeded member");
+
+        let member_row = db
+            .members_tree()
+            .expect("open members tree")
+            .get(member.structural_hash.as_bytes())
+            .expect("load member row")
+            .expect("member row exists");
+        let ir_text_row = db
+            .ir_text_tree()
+            .expect("open IR text tree")
+            .get(member.structural_hash.as_bytes())
+            .expect("load IR text row")
+            .expect("IR text row exists");
+
+        let stored_member_value: StoredMemberValue =
+            serde_json::from_slice(member_row.as_ref()).expect("parse member metadata row");
+        assert_eq!(stored_member_value.package_name, "seed");
+        assert_eq!(stored_member_value.top_name, "seed_fn");
+        assert_eq!(
+            stored_member_value
+                .metadata
+                .tags
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![
+                "bf16".to_string(),
+                ir_node_count_tag_for_path(&ir_path),
+                "seed".to_string(),
+            ]
+        );
+        let member_row_text = std::str::from_utf8(member_row.as_ref()).expect("member row utf8");
+        assert!(!member_row_text.contains("\"ir_text\""));
+        assert!(!member_row_text.contains("identity.2"));
+
+        let decoded_ir_text = decode_ir_text_value(ir_text_row.as_ref()).expect("decode IR text");
+        assert!(decoded_ir_text.contains("identity.2"));
     }
 
     #[test]
@@ -846,7 +955,10 @@ top fn renamed_fn(arg: bits[8]) -> bits[8] {
         assert_eq!(members.len(), 1);
         assert_eq!(members[0].package_name, "seed");
         assert_eq!(members[0].top_name, "seed_fn");
-        assert!(members[0].metadata.tags.is_empty());
+        assert_eq!(
+            members[0].metadata.tags,
+            BTreeSet::from([ir_node_count_tag_for_path(&ir_path)])
+        );
         assert_eq!(members[0].metadata.provenance, None);
         assert!(members[0].metadata.added_at_utc_secs > 0);
     }
@@ -865,6 +977,8 @@ top fn renamed_fn(arg: bits[8]) -> bits[8] {
             &ProofOptions::default(),
         )
         .expect("seed add with metadata");
+        let seed_count_tag = ir_node_count_tag_for_path(&seed_path);
+        let add_zero_count_tag = ir_node_count_tag_for_path(&add_zero_path);
         db.insert_member(
             &LoadedIr::from_path(&add_zero_path, None).expect("load add_zero"),
             normalize_new_member_metadata(&metadata_with(
@@ -889,27 +1003,28 @@ top fn renamed_fn(arg: bits[8]) -> bits[8] {
                 .iter()
                 .cloned()
                 .collect::<Vec<_>>(),
-            vec!["add".to_string(), "bf16".to_string()]
+            vec![
+                "add".to_string(),
+                "bf16".to_string(),
+                seed_count_tag.clone(),
+            ]
         );
         assert_eq!(seed_member.metadata.added_at_utc_secs, 1_700_000_000);
 
         let tag_counts = db.list_tags().expect("list tags");
+        let tag_counts: BTreeMap<String, usize> = tag_counts
+            .into_iter()
+            .map(|tag_count| (tag_count.tag, tag_count.count))
+            .collect();
         assert_eq!(
             tag_counts,
-            vec![
-                TagCount {
-                    tag: "add".to_string(),
-                    count: 1
-                },
-                TagCount {
-                    tag: "bf16".to_string(),
-                    count: 2
-                },
-                TagCount {
-                    tag: "identity".to_string(),
-                    count: 1
-                },
-            ]
+            BTreeMap::from([
+                ("add".to_string(), 1),
+                ("bf16".to_string(), 2),
+                ("identity".to_string(), 1),
+                (seed_count_tag.clone(), 1),
+                (add_zero_count_tag.clone(), 1),
+            ])
         );
 
         let filtered = db
@@ -917,6 +1032,18 @@ top fn renamed_fn(arg: bits[8]) -> bits[8] {
             .expect("filter by tags");
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].metadata.added_at_utc_secs, 1_700_000_005);
+
+        let filtered_by_node_count = db
+            .list_members_filtered_by_tags(std::slice::from_ref(&add_zero_count_tag))
+            .expect("filter by IR node count");
+        assert_eq!(filtered_by_node_count.len(), 1);
+        assert_eq!(
+            filtered_by_node_count[0]
+                .metadata
+                .tags
+                .contains(&add_zero_count_tag),
+            true
+        );
     }
 
     #[test]
@@ -954,18 +1081,25 @@ top fn renamed_fn(arg: bits[8]) -> bits[8] {
 
         let members = db.list_members().expect("list members");
         let key = members[0].structural_hash.clone();
-        let tree = db.members_tree().expect("open members tree");
+        let member_tree = db.members_tree().expect("open members tree");
+        let ir_text_tree = db.ir_text_tree().expect("open IR text tree");
         let corrupted = StoredMemberValue {
             package_name: "not_pkg".to_string(),
             top_name: "not_fn".to_string(),
-            ir_text: NOT_IR.to_string(),
             metadata: StoredMemberMetadataValue::default(),
         };
-        tree.insert(
-            key.as_bytes(),
-            serde_json::to_vec(&corrupted).expect("serialize corruption"),
-        )
-        .expect("corrupt row");
+        member_tree
+            .insert(
+                key.as_bytes(),
+                serde_json::to_vec(&corrupted).expect("serialize corruption"),
+            )
+            .expect("corrupt row");
+        ir_text_tree
+            .insert(
+                key.as_bytes(),
+                encode_ir_text_value(NOT_IR.as_bytes()).expect("encode corrupt IR"),
+            )
+            .expect("corrupt IR row");
         db.db.flush().expect("flush db");
 
         let error = db
