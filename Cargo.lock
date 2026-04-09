@@ -128,6 +128,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bitwuzla-sys"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff63cfc9ecd7406fbe2c008bd51091562e88c7b845b29df99679adb4a0e8bad2"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "blake3"
 version = "1.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1626,6 +1635,7 @@ dependencies = [
 name = "xlsynth-prover"
 version = "0.40.0"
 dependencies = [
+ "bitwuzla-sys",
  "clap",
  "log",
  "num_cpus",

@@ -23,6 +23,8 @@ const TREE_MEMBERS: &str = "members";
 const TREE_IR_TEXT: &str = "ir_text";
 const TREE_TAG_INDEX: &str = "tag_index";
 const KEY_SCHEMA_VERSION: &[u8] = b"schema_version";
+const KEY_CANONICAL_STRUCTURAL_HASH: &[u8] = b"canonical_structural_hash";
+const KEY_EXPECTED_SIGNATURE: &[u8] = b"expected_signature";
 const IR_TEXT_ZSTD_MAGIC: &[u8] = b"EQCIRTXT1";
 const IR_NODE_COUNT_TAG_PREFIX: &str = "ir-nodes:";
 
@@ -145,6 +147,7 @@ struct LoadedIr {
     package: ir::Package,
     package_name: String,
     top_name: String,
+    signature: String,
     structural_hash: String,
     canonical_ir_text: String,
 }
@@ -171,6 +174,7 @@ impl LoadedIr {
             .get_top_fn()
             .ok_or_else(|| anyhow!("{origin} does not contain a top function"))?;
         let top_name = top_fn.name.clone();
+        let signature = format_ir_fn_signature(top_fn);
         let package_name = package.name.clone();
         let structural_hash = hash_to_hex(compute_function_structural_hash(top_fn).as_bytes());
         let canonical_ir_text = package.to_string();
@@ -179,6 +183,7 @@ impl LoadedIr {
             package,
             package_name,
             top_name,
+            signature,
             structural_hash,
             canonical_ir_text,
         })
@@ -240,6 +245,49 @@ impl EquivalenceClassDb {
 
     pub fn len(&self) -> Result<usize> {
         Ok(self.members_tree()?.len())
+    }
+
+    pub fn expected_signature(&self) -> Result<Option<String>> {
+        if let Some(existing) = self.read_expected_signature()? {
+            return Ok(Some(existing));
+        }
+
+        let expected_signature = self.select_expected_signature_from_members()?;
+        self.write_expected_signature(expected_signature.as_deref())?;
+        self.db
+            .flush()
+            .context("flushing expected signature metadata")?;
+        Ok(expected_signature)
+    }
+
+    pub fn set_expected_signature(&self, expected_signature: &str) -> Result<()> {
+        let expected_signature = normalize_expected_signature(expected_signature)?;
+        if let Some(existing) = self.read_expected_signature()? {
+            if existing != expected_signature {
+                bail!(
+                    "equivalence-class expected signature mismatch: existing {} new {}",
+                    existing,
+                    expected_signature
+                );
+            }
+            return Ok(());
+        }
+
+        if let Some(existing_member_signature) = self.select_expected_signature_from_members()? {
+            if existing_member_signature != expected_signature {
+                bail!(
+                    "equivalence-class members use signature {} which does not match requested {}",
+                    existing_member_signature,
+                    expected_signature
+                );
+            }
+        }
+
+        self.write_expected_signature(Some(&expected_signature))?;
+        self.db
+            .flush()
+            .context("flushing expected signature metadata")?;
+        Ok(())
     }
 
     pub fn list_members(&self) -> Result<Vec<StoredMember>> {
@@ -393,6 +441,7 @@ impl EquivalenceClassDb {
 
     pub fn check_invariants(&self, proof_options: &ProofOptions) -> Result<InvariantReport> {
         let members = self.list_members()?;
+        let expected_signature = self.expected_signature()?;
         if members.len() <= 1 {
             if let Some(member) = members.first() {
                 let loaded = LoadedIr::from_stored_member(member)?;
@@ -404,13 +453,21 @@ impl EquivalenceClassDb {
                         loaded.structural_hash
                     );
                 }
+                if let Some(expected_signature) = expected_signature.as_ref() {
+                    ensure_signature_matches(expected_signature, &loaded)?;
+                }
             }
             return Ok(InvariantReport {
                 member_count: members.len(),
             });
         }
 
-        let mut loaded_members = Vec::with_capacity(members.len());
+        let canonical_hash = self
+            .canonical_structural_hash()?
+            .ok_or_else(|| anyhow!("missing canonical member for non-empty equivalence class"))?;
+
+        let mut canonical = None;
+        let mut other_members = Vec::with_capacity(members.len().saturating_sub(1));
         let mut actual_hashes = BTreeSet::new();
         for member in &members {
             let loaded = LoadedIr::from_stored_member(member)?;
@@ -428,15 +485,27 @@ impl EquivalenceClassDb {
                     loaded.structural_hash
                 );
             }
-            loaded_members.push(loaded);
+            if let Some(expected_signature) = expected_signature.as_ref() {
+                ensure_signature_matches(expected_signature, &loaded)?;
+            }
+            if member.structural_hash == canonical_hash {
+                canonical = Some(loaded);
+            } else {
+                other_members.push(loaded);
+            }
         }
 
+        let canonical = canonical.ok_or_else(|| {
+            anyhow!(
+                "canonical member {} was not found in the corpus",
+                canonical_hash
+            )
+        })?;
         let prover = make_prover(proof_options);
-        let canonical = &loaded_members[0];
-        for member in loaded_members.iter().skip(1) {
+        for member in &other_members {
             ensure_equivalent(
                 &*prover,
-                canonical,
+                &canonical,
                 member,
                 &format!("stored canonical member {}", canonical.structural_hash),
                 &format!("stored member {}", member.structural_hash),
@@ -444,7 +513,7 @@ impl EquivalenceClassDb {
         }
 
         Ok(InvariantReport {
-            member_count: loaded_members.len(),
+            member_count: members.len(),
         })
     }
 
@@ -462,11 +531,18 @@ impl EquivalenceClassDb {
         }
 
         let existing_len = self.len()?;
+        self.ensure_expected_signature_matches(&candidate)?;
         if existing_len > 0 {
             self.validate_loaded(&candidate, proof_options)?;
         }
 
         self.insert_member(&candidate, normalize_new_member_metadata(metadata)?)?;
+        if existing_len == 0 && self.read_expected_signature()?.is_none() {
+            self.write_expected_signature(Some(&candidate.signature))?;
+        }
+        self.db
+            .flush()
+            .context("flushing member and expected signature metadata")?;
         Ok(if existing_len == 0 {
             AddOutcome::Seeded {
                 structural_hash: candidate.structural_hash,
@@ -483,25 +559,30 @@ impl EquivalenceClassDb {
         candidate: &LoadedIr,
         proof_options: &ProofOptions,
     ) -> Result<ValidationReport> {
+        self.ensure_expected_signature_matches(candidate)?;
         let members = self.list_members()?;
         if members.is_empty() {
             bail!("cannot validate against an empty equivalence class");
         }
 
+        let canonical_hash = self
+            .canonical_structural_hash()?
+            .ok_or_else(|| anyhow!("missing canonical member for non-empty equivalence class"))?;
         let prover = make_prover(proof_options);
-        for member in &members {
-            let stored = LoadedIr::from_stored_member(member)?;
-            ensure_equivalent(
-                &*prover,
-                candidate,
-                &stored,
-                &candidate.origin,
-                &format!("stored member {}", member.structural_hash),
-            )?;
-        }
+        let stored = self
+            .member_by_structural_hash(&canonical_hash)?
+            .ok_or_else(|| anyhow!("missing canonical member {}", canonical_hash))?;
+        let stored = LoadedIr::from_stored_member(&stored)?;
+        ensure_equivalent(
+            &*prover,
+            candidate,
+            &stored,
+            &candidate.origin,
+            &format!("stored canonical member {canonical_hash}"),
+        )?;
 
         Ok(ValidationReport {
-            compared_against: members.len(),
+            compared_against: 1,
         })
     }
 
@@ -559,7 +640,196 @@ impl EquivalenceClassDb {
                     )
                 })?;
         }
+        self.promote_canonical_member_if_better(candidate, &metadata)?;
         self.db.flush().context("flushing member insert")?;
+        Ok(())
+    }
+
+    fn canonical_structural_hash(&self) -> Result<Option<String>> {
+        if let Some(existing) = self.read_canonical_structural_hash()? {
+            if self
+                .members_tree()?
+                .contains_key(existing.as_bytes())
+                .with_context(|| format!("checking canonical member {}", existing))?
+            {
+                return Ok(Some(existing));
+            }
+        }
+
+        let canonical = self.select_canonical_structural_hash()?;
+        self.write_canonical_structural_hash(canonical.as_deref())?;
+        self.db
+            .flush()
+            .context("flushing canonical member metadata")?;
+        Ok(canonical)
+    }
+
+    fn read_canonical_structural_hash(&self) -> Result<Option<String>> {
+        let Some(bytes) = self
+            .metadata_tree()?
+            .get(KEY_CANONICAL_STRUCTURAL_HASH)
+            .context("reading canonical member hash")?
+        else {
+            return Ok(None);
+        };
+        let hash = std::str::from_utf8(bytes.as_ref())
+            .context("canonical member hash was not valid UTF-8")?
+            .to_string();
+        Ok(Some(hash))
+    }
+
+    fn read_expected_signature(&self) -> Result<Option<String>> {
+        let Some(bytes) = self
+            .metadata_tree()?
+            .get(KEY_EXPECTED_SIGNATURE)
+            .context("reading expected signature")?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(
+            std::str::from_utf8(bytes.as_ref())
+                .context("expected signature was not valid UTF-8")?
+                .to_string(),
+        ))
+    }
+
+    fn write_canonical_structural_hash(&self, structural_hash: Option<&str>) -> Result<()> {
+        let tree = self.metadata_tree()?;
+        match structural_hash {
+            Some(structural_hash) => {
+                tree.insert(KEY_CANONICAL_STRUCTURAL_HASH, structural_hash.as_bytes())
+                    .with_context(|| {
+                        format!("writing canonical member hash {}", structural_hash)
+                    })?;
+            }
+            None => {
+                tree.remove(KEY_CANONICAL_STRUCTURAL_HASH)
+                    .context("clearing canonical member hash")?;
+            }
+        }
+        Ok(())
+    }
+
+    fn write_expected_signature(&self, expected_signature: Option<&str>) -> Result<()> {
+        let tree = self.metadata_tree()?;
+        match expected_signature {
+            Some(expected_signature) => {
+                tree.insert(KEY_EXPECTED_SIGNATURE, expected_signature.as_bytes())
+                    .with_context(|| {
+                        format!("writing expected signature {}", expected_signature)
+                    })?;
+            }
+            None => {
+                tree.remove(KEY_EXPECTED_SIGNATURE)
+                    .context("clearing expected signature")?;
+            }
+        }
+        Ok(())
+    }
+
+    fn select_canonical_structural_hash(&self) -> Result<Option<String>> {
+        let members = self.members_tree()?;
+        let ir_text_tree = self.ir_text_tree()?;
+        let mut best: Option<(String, usize)> = None;
+        for row in &members {
+            let (key, value) = row.context("reading member row from sled")?;
+            let structural_hash = std::str::from_utf8(key.as_ref())
+                .context("member key was not valid UTF-8")?
+                .to_string();
+            let value: StoredMemberValue = serde_json::from_slice(value.as_ref())
+                .context("deserializing member metadata while selecting canonical member")?;
+            let node_count =
+                stored_member_node_count(&structural_hash, &value.metadata, &ir_text_tree)?;
+            match &best {
+                Some((best_hash, best_node_count))
+                    if !is_better_canonical_candidate(
+                        &structural_hash,
+                        node_count,
+                        best_hash,
+                        *best_node_count,
+                    ) => {}
+                _ => best = Some((structural_hash, node_count)),
+            }
+        }
+        Ok(best.map(|(structural_hash, _)| structural_hash))
+    }
+
+    fn promote_canonical_member_if_better(
+        &self,
+        candidate: &LoadedIr,
+        metadata: &StoredMemberMetadataValue,
+    ) -> Result<()> {
+        let candidate_node_count = stored_member_node_count_from_tags(&metadata.tags)?
+            .unwrap_or_else(|| fn_node_count(candidate.top_fn()));
+        let current_hash = self.canonical_structural_hash()?;
+        let promote = match current_hash {
+            Some(current_hash) if current_hash != candidate.structural_hash => {
+                match self.member_node_count_by_hash(&current_hash)? {
+                    Some(current_node_count) => is_better_canonical_candidate(
+                        &candidate.structural_hash,
+                        candidate_node_count,
+                        &current_hash,
+                        current_node_count,
+                    ),
+                    None => true,
+                }
+            }
+            Some(_) => false,
+            None => true,
+        };
+        if promote {
+            self.write_canonical_structural_hash(Some(&candidate.structural_hash))?;
+        }
+        Ok(())
+    }
+
+    fn member_by_structural_hash(&self, structural_hash: &str) -> Result<Option<StoredMember>> {
+        let member_row = self
+            .members_tree()?
+            .get(structural_hash.as_bytes())
+            .with_context(|| format!("loading member {}", structural_hash))?;
+        let Some(member_row) = member_row else {
+            return Ok(None);
+        };
+        let ir_text_tree = self.ir_text_tree()?;
+        Ok(Some(decode_member_row(
+            structural_hash.as_bytes(),
+            member_row.as_ref(),
+            &ir_text_tree,
+        )?))
+    }
+
+    fn member_node_count_by_hash(&self, structural_hash: &str) -> Result<Option<usize>> {
+        let member_row = self
+            .members_tree()?
+            .get(structural_hash.as_bytes())
+            .with_context(|| format!("loading member metadata for {}", structural_hash))?;
+        let Some(member_row) = member_row else {
+            return Ok(None);
+        };
+        let value: StoredMemberValue = serde_json::from_slice(member_row.as_ref())
+            .with_context(|| format!("deserializing member metadata for {}", structural_hash))?;
+        let ir_text_tree = self.ir_text_tree()?;
+        Ok(Some(stored_member_node_count(
+            structural_hash,
+            &value.metadata,
+            &ir_text_tree,
+        )?))
+    }
+
+    fn select_expected_signature_from_members(&self) -> Result<Option<String>> {
+        let mut members = self.list_members()?.into_iter();
+        let Some(member) = members.next() else {
+            return Ok(None);
+        };
+        let loaded = LoadedIr::from_stored_member(&member)?;
+        Ok(Some(loaded.signature))
+    }
+
+    fn ensure_expected_signature_matches(&self, candidate: &LoadedIr) -> Result<()> {
+        if let Some(expected_signature) = self.expected_signature()? {
+            ensure_signature_matches(&expected_signature, candidate)?;
+        }
         Ok(())
     }
 
@@ -650,8 +920,88 @@ fn with_derived_member_tags(
     metadata
 }
 
+fn stored_member_node_count(
+    structural_hash: &str,
+    metadata: &StoredMemberMetadataValue,
+    ir_text_tree: &sled::Tree,
+) -> Result<usize> {
+    if let Some(node_count) = stored_member_node_count_from_tags(&metadata.tags)? {
+        return Ok(node_count);
+    }
+
+    let ir_text = load_ir_text(ir_text_tree, structural_hash.as_bytes())?;
+    let loaded =
+        LoadedIr::from_ir_text(&ir_text, None, format!("stored member {}", structural_hash))?;
+    Ok(fn_node_count(loaded.top_fn()))
+}
+
+fn stored_member_node_count_from_tags(tags: &BTreeSet<String>) -> Result<Option<usize>> {
+    let mut node_counts = tags
+        .iter()
+        .filter_map(|tag| tag.strip_prefix(IR_NODE_COUNT_TAG_PREFIX));
+    let Some(first) = node_counts.next() else {
+        return Ok(None);
+    };
+    let node_count = first
+        .parse::<usize>()
+        .with_context(|| format!("invalid IR node count tag value: {first}"))?;
+    if let Some(second) = node_counts.next() {
+        bail!(
+            "multiple IR node count tags present: {}{}, {}",
+            IR_NODE_COUNT_TAG_PREFIX,
+            first,
+            second
+        );
+    }
+    Ok(Some(node_count))
+}
+
 fn ir_node_count_tag(ir_fn: &ir::Fn) -> String {
     format!("{IR_NODE_COUNT_TAG_PREFIX}{}", fn_node_count(ir_fn))
+}
+
+fn format_ir_fn_signature(ir_fn: &ir::Fn) -> String {
+    let fn_type = ir_fn.get_type();
+    let params = fn_type
+        .param_types
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("({params}) -> {}", fn_type.return_type)
+}
+
+fn normalize_expected_signature(expected_signature: &str) -> Result<String> {
+    let expected_signature = expected_signature.trim();
+    if expected_signature.is_empty() {
+        bail!("expected signature cannot be empty");
+    }
+    if expected_signature.contains('\0') {
+        bail!("expected signature cannot contain NUL bytes");
+    }
+    Ok(expected_signature.to_string())
+}
+
+fn ensure_signature_matches(expected_signature: &str, loaded: &LoadedIr) -> Result<()> {
+    if loaded.signature != expected_signature {
+        bail!(
+            "top signature mismatch for {}: expected {} got {}",
+            loaded.origin,
+            expected_signature,
+            loaded.signature
+        );
+    }
+    Ok(())
+}
+
+fn is_better_canonical_candidate(
+    candidate_hash: &str,
+    candidate_node_count: usize,
+    current_hash: &str,
+    current_node_count: usize,
+) -> bool {
+    candidate_node_count < current_node_count
+        || (candidate_node_count == current_node_count && candidate_hash < current_hash)
 }
 
 fn encode_ir_text_value(raw_bytes: &[u8]) -> Result<Vec<u8>> {
@@ -827,6 +1177,14 @@ top fn add_zero_fn(x: bits[8]) -> bits[8] {
 }
 "#;
 
+    const OR_ZERO_IR: &str = r#"package or_zero
+
+top fn or_zero_fn(x: bits[8]) -> bits[8] {
+  literal.2: bits[8] = literal(value=0, id=2)
+  ret or.3: bits[8] = or(x, literal.2, id=3)
+}
+"#;
+
     const NOT_IR: &str = r#"package not_pkg
 
 top fn not_fn(x: bits[8]) -> bits[8] {
@@ -838,6 +1196,13 @@ top fn not_fn(x: bits[8]) -> bits[8] {
 
 top fn renamed_fn(arg: bits[8]) -> bits[8] {
   ret identity.2: bits[8] = identity(arg, id=2)
+}
+"#;
+
+    const IDENTITY16_IR: &str = r#"package seed16
+
+top fn seed16_fn(x: bits[16]) -> bits[16] {
+  ret identity.2: bits[16] = identity(x, id=2)
 }
 "#;
 
@@ -868,6 +1233,12 @@ top fn renamed_fn(arg: bits[8]) -> bits[8] {
     fn ir_node_count_tag_for_path(path: &Path) -> String {
         let loaded = LoadedIr::from_path(path, None).expect("load IR for node count tag");
         ir_node_count_tag(loaded.top_fn())
+    }
+
+    fn ir_signature_for_path(path: &Path) -> String {
+        LoadedIr::from_path(path, None)
+            .expect("load IR for signature")
+            .signature
     }
 
     #[test]
@@ -961,6 +1332,10 @@ top fn renamed_fn(arg: bits[8]) -> bits[8] {
         );
         assert_eq!(members[0].metadata.provenance, None);
         assert!(members[0].metadata.added_at_utc_secs > 0);
+        assert_eq!(
+            db.expected_signature().expect("expected signature"),
+            Some(ir_signature_for_path(&ir_path))
+        );
     }
 
     #[test]
@@ -1133,12 +1508,92 @@ top fn renamed_fn(arg: bits[8]) -> bits[8] {
         let validate_report = db
             .validate_ir_path(&add_zero_path, None, &ProofOptions::default())
             .expect("validate equivalent");
-        assert_eq!(validate_report.compared_against, 2);
+        assert_eq!(validate_report.compared_against, 1);
 
         let invariant_report = db
             .check_invariants(&ProofOptions::default())
             .expect("check invariants");
         assert_eq!(invariant_report.member_count, 2);
+    }
+
+    #[test]
+    fn canonical_member_promotes_to_smallest_node_count_and_backfills_when_missing() {
+        if std::env::var_os("XLSYNTH_TOOLS").is_none() {
+            return;
+        }
+
+        let (tempdir, db_path) = make_temp_db();
+        let add_zero_path = write_ir(&tempdir, "add_zero.ir", ADD_ZERO_IR);
+        let seed_path = write_ir(&tempdir, "seed.ir", IDENTITY_IR);
+        let or_zero_path = write_ir(&tempdir, "or_zero.ir", OR_ZERO_IR);
+
+        let db = EquivalenceClassDb::init(&db_path).expect("init db");
+        let add_zero_hash = LoadedIr::from_path(&add_zero_path, None)
+            .expect("load add_zero")
+            .structural_hash;
+        db.add_ir_path(&add_zero_path, None, &ProofOptions::default())
+            .expect("seed add");
+        assert_eq!(
+            db.canonical_structural_hash().expect("canonical hash"),
+            Some(add_zero_hash)
+        );
+
+        let seed_hash = LoadedIr::from_path(&seed_path, None)
+            .expect("load seed")
+            .structural_hash;
+        db.add_ir_path(&seed_path, None, &ProofOptions::default())
+            .expect("add smaller canonical");
+        assert_eq!(
+            db.canonical_structural_hash().expect("canonical hash"),
+            Some(seed_hash.clone())
+        );
+
+        db.metadata_tree()
+            .expect("metadata tree")
+            .remove(KEY_CANONICAL_STRUCTURAL_HASH)
+            .expect("remove canonical hash");
+        db.db.flush().expect("flush db");
+
+        assert_eq!(
+            db.canonical_structural_hash()
+                .expect("backfilled canonical hash"),
+            Some(seed_hash)
+        );
+
+        let validate_report = db
+            .validate_ir_path(&or_zero_path, None, &ProofOptions::default())
+            .expect("validate using canonical member only");
+        assert_eq!(validate_report.compared_against, 1);
+    }
+
+    #[test]
+    fn expected_signature_rejects_wrong_shape_and_backfills_when_missing() {
+        let (tempdir, db_path) = make_temp_db();
+        let seed_path = write_ir(&tempdir, "seed.ir", IDENTITY_IR);
+        let identity16_path = write_ir(&tempdir, "seed16.ir", IDENTITY16_IR);
+
+        let db = EquivalenceClassDb::init(&db_path).expect("init db");
+        db.set_expected_signature(&ir_signature_for_path(&seed_path))
+            .expect("set expected signature");
+        db.add_ir_path(&seed_path, None, &ProofOptions::default())
+            .expect("seed add");
+
+        let error = db
+            .validate_ir_path(&identity16_path, None, &ProofOptions::default())
+            .expect_err("wrong signature should fail validation");
+        assert!(error.to_string().contains("top signature mismatch"));
+
+        db.metadata_tree()
+            .expect("metadata tree")
+            .remove(KEY_EXPECTED_SIGNATURE)
+            .expect("remove expected signature");
+        db.db.flush().expect("flush db");
+
+        assert_eq!(
+            db.expected_signature()
+                .expect("backfilled expected signature"),
+            Some(ir_signature_for_path(&seed_path))
+        );
     }
 
     #[test]
