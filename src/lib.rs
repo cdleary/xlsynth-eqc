@@ -1143,6 +1143,9 @@ fn ensure_equivalent(
         EquivResult::ToolchainDisproved(message) => {
             bail!("{lhs_label} is not equivalent to {rhs_label}: {message}")
         }
+        EquivResult::Interrupted => {
+            bail!("equivalence check interrupted for {lhs_label} vs {rhs_label}")
+        }
         EquivResult::Error(message) => {
             bail!("equivalence check failed for {lhs_label} vs {rhs_label}: {message}")
         }

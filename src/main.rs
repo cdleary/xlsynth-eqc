@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use anyhow::{Context, Result, anyhow};
 use clap::{Args, Parser, Subcommand};
-use xlsynth_eqc::{EquivalenceClassDb, NewMemberMetadata, ProofOptions, TryAddOutcome};
+use xlsynth_eqc::{
+    EquivalenceClassDb, NewMemberMetadata, ProofOptions, StoredMember, TryAddOutcome,
+};
 use xlsynth_pir::ir_parser;
 use xlsynth_pir::ir_utils::fn_node_count;
 use xlsynth_prover::prover::SolverChoice;
@@ -37,6 +39,8 @@ enum Command {
     ListTags {
         db: PathBuf,
     },
+    #[command(name = "to-dir")]
+    ToDir(ToDirArgs),
     CheckInvariants(ProofDbArgs),
 }
 
@@ -113,6 +117,13 @@ struct ListArgs {
     db: PathBuf,
     #[arg(long = "tag")]
     tags: Vec<String>,
+}
+
+#[derive(Args)]
+struct ToDirArgs {
+    db: PathBuf,
+    #[arg(long = "output-dir")]
+    output_dir: PathBuf,
 }
 
 #[derive(Args)]
@@ -207,6 +218,16 @@ fn main() -> Result<()> {
             for tag_count in db.list_tags()? {
                 println!("{}\t{}", tag_count.tag, tag_count.count);
             }
+        }
+        Command::ToDir(args) => {
+            let db = EquivalenceClassDb::open(&args.db)?;
+            let members = db.list_members()?;
+            write_members_to_dir(&args.output_dir, &members)?;
+            println!(
+                "wrote {} IR files to {}",
+                members.len(),
+                args.output_dir.display()
+            );
         }
         Command::CheckInvariants(args) => {
             let db = EquivalenceClassDb::open(&args.db)?;
@@ -536,4 +557,59 @@ fn format_top_signature(top_fn: &xlsynth_pir::ir::Fn) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!("({params}) -> {}", fn_type.return_type)
+}
+
+fn write_members_to_dir(output_dir: &Path, members: &[StoredMember]) -> Result<()> {
+    fs::create_dir_all(output_dir)
+        .with_context(|| format!("creating output directory {}", output_dir.display()))?;
+    for member in members {
+        let output_path = output_dir.join(format!("{}.ir", member.structural_hash));
+        fs::write(&output_path, &member.ir_text)
+            .with_context(|| format!("writing {}", output_path.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    use tempfile::TempDir;
+    use xlsynth_eqc::MemberMetadata;
+
+    fn stored_member(structural_hash: &str, ir_text: &str) -> StoredMember {
+        StoredMember {
+            structural_hash: structural_hash.to_string(),
+            package_name: "pkg".to_string(),
+            top_name: "top".to_string(),
+            ir_text: ir_text.to_string(),
+            metadata: MemberMetadata {
+                tags: BTreeSet::new(),
+                provenance: None,
+                added_at_utc_secs: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn write_members_to_dir_creates_structural_hash_named_ir_files() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let output_dir = tempdir.path().join("exported");
+        let members = vec![
+            stored_member("abc123", "package first\n"),
+            stored_member("def456", "package second\n"),
+        ];
+
+        write_members_to_dir(&output_dir, &members).expect("write members");
+
+        assert_eq!(
+            fs::read_to_string(output_dir.join("abc123.ir")).expect("read first file"),
+            "package first\n"
+        );
+        assert_eq!(
+            fs::read_to_string(output_dir.join("def456.ir")).expect("read second file"),
+            "package second\n"
+        );
+    }
 }
